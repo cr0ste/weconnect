@@ -8,11 +8,13 @@ import _version
 import logging
 import credentials
 from vsr import VSR
+import re
 
 logging.basicConfig(format='[%(asctime)s] [%(name)s::%(levelname)s] %(message)s', datefmt='%d/%m/%Y %H:%M:%S')
 
 logger = logging.getLogger('API')
 logger.setLevel(logging.getLogger().level)
+# logger.setLevel(logging.DEBUG)
 
 class VWError(Exception):
     def __init__(self, message):
@@ -152,11 +154,13 @@ class WeConnect():
             logger.debug('Scope: %s', scope['__name__'])
         if (secure_token):
             logger.debug('Secure token: %s', secure_token)
-        try:
-            if (not self.__check_tokens()):
-                self.__force_login()
-        except UrlError as e:
-            raise VWError('Aborting command {}: login failed ({})'.format(command,e.message))
+
+        if(not self.__check_tokens()):
+            logger.debug('Command {}: Tokens are not valid. New login is required.'.format(command))
+            self.__force_login()
+            if(not self.__check_tokens()):
+                raise VWError('Aborting command {}: Tokens are still not valid even after forced login'.format(command))
+       
         headers = {
             'Authorization': 'Bearer '+scope['access_token'],
             'Accept': accept,
@@ -167,9 +171,10 @@ class WeConnect():
         if (content_type):
             headers['Content-Type'] = content_type
         if (secure_token):
-            headers['X-MBBSecToken'] = secure_token
+            headers['X-MBBSecToken'] = secure_token        
+
         r = self.__get_url(dashboard+command, json=post, post=data, headers=headers)
-        if ('json' in r.headers['Content-Type']):
+        if ('Content-Type' in r.headers and 'json' in r.headers['Content-Type']):
             jr = r.json()
             return jr
         return r
@@ -228,9 +233,9 @@ class WeConnect():
     def __check_kit_tokens(self):
         if (self.__tokens):
             if (self.__tokens['timestamp']+self.__tokens['expires_in'] > time.time()):
-                logger.debug('Tokens still valid')
+                logger.debug('Kit Tokens still valid')
                 return True
-            logger.debug('Token expired. Refreshing tokens')
+            logger.debug('Tokens expired. Refreshing tokens')
             r = self.__get_url(self.TOKEN_URL+'/refreshTokens', post={'refresh_token': self.__tokens['refresh_token']})
             self.__tokens = r.json()
             self.__tokens['timestamp'] = time.time()
@@ -249,7 +254,7 @@ class WeConnect():
             if (scope in self.__oauth and 'refresh_token' in self.__oauth[scope]):
                 self.__refresh_oauth_scope(scope)
                 return True
-            logger.error('OAUTH {} not present. Cannot refresh'.format(scope))
+            logger.debug('OAUTH {} not present. Cannot refresh'.format(scope))
         logger.debug('OAuth [%s] checking failed', scope)
         return False
     
@@ -258,7 +263,14 @@ class WeConnect():
     
     def __check_tokens(self):
         logger.debug('Checking tokens')
-        return self.__check_kit_tokens() and self.__check_oauth_tokens()
+        try: 
+            tokens_valid = self.__check_kit_tokens() and self.__check_oauth_tokens()
+            if (not tokens_valid):
+                logger.debug('Tokens are not valid')
+            return tokens_valid
+        except Exception as e:
+            logger.warning('Caught exception during check of tokens: {}'.format(e))
+            return False
         
     def __save_access(self):
         t = {}
@@ -272,13 +284,24 @@ class WeConnect():
         logger.info('Saving access to file')
         
     def login(self):
-        logger.info('logger')
-        if (not self.__check_tokens()):
-            return self.__force_login()
-        return True
+        logger.info('Login')
+        try: 
+            if(self.__check_tokens()):
+                logger.debug('Login: Tokens are still valid. No new login required.')
+                return True
+            else:
+                logger.info('Login: Tokens are not valid. New login is required.')
+                self.__force_login()
+                if(not self.__check_tokens()):
+                    logger.error("Login: Tokens are not valid even after forced login")
+                    return False
+                return True
+        except Exception as e:        
+            logger.error("Caught exception ({}) during login".format(e))
+            return False
     
     def __force_login(self):
-            logger.warning('Forcing login')
+            logger.info('Forced login')
             code_verifier = base64URLEncode(os.urandom(32))
             if len(code_verifier) < 43:
                 raise ValueError("Verifier too short. n_bytes must be > 30.")
@@ -315,29 +338,32 @@ class WeConnect():
             
             upr = urlparse(r.url)
             r = self.__get_url(upr.scheme+'://'+upr.netloc+form_url, post=post)
-            soup = BeautifulSoup(r.text, 'html.parser')
-            form = soup.find('form', {'id': 'credentialsForm'})
-            if (not form):
-                form = soup.find('form', {'id': 'emailPasswordForm'})
-                if (form):
-                    span = form.find('span', { 'class': 'message'})
-                    e = 'Cannot login. Unknown error.'
-                    if (span):
-                        e = span.text
-                    else:
-                        div = form.find('div', {'class': 'sub-title'})
-                        if (div):
-                            e = div.text
-                    raise VWError(e)
-                raise VWError('This account does not exist')
-            if (not form.has_attr('action')):
-                raise VWError('action not found in login password form. Cannot continue')
-            form_url = form['action']
-            logger.info('Found password login url: %s', form_url)
-            hiddn = form.find_all('input', {'type': 'hidden'})
-            post = {}
-            for h in hiddn:
-                post[h['name']] = h['value']
+            credentialsTemplateRegex = r'<script>\s+window\._IDK\s+=\s+\{\s' \
+                r'(?P<templateModel>.+?(?=\s+\};\s+</script>))\s+\};\s+</script>'
+            match = re.search(credentialsTemplateRegex, r.text, flags=re.DOTALL)
+
+            if match.groupdict()['templateModel']:
+                lineRegex = r'\s*(?P<name>[^\:]+)\:\s+[\'\{]?(?P<value>.+)[\'\}][,]?'
+                post = {}
+                for match in re.finditer(lineRegex, match.groupdict()['templateModel']):
+                    if match.groupdict()['name'] == 'templateModel':
+                        templateModelString = '{' + match.groupdict()['value'] + '}'
+                        if templateModelString.endswith(','):
+                            templateModelString = templateModelString[:-len(',')]
+                        templateModel = json.loads(templateModelString)
+                        if 'relayState' in templateModel:
+                            post['relayState'] = templateModel['relayState']
+                        if 'hmac' in templateModel:
+                            post['hmac'] = templateModel['hmac']
+                        if 'postAction' in templateModel:
+                            form_url = '/signin-service/v1/'+login_para['client_id']+'/'+templateModel['postAction']
+                        if 'emailPasswordForm' in templateModel and 'email' in templateModel['emailPasswordForm']:
+                            post['email'] = templateModel['emailPasswordForm']['email']
+                        if 'errorCode' in templateModel:
+                            raise VWError(templateModel['errorCode'])
+                    elif match.groupdict()['name'] == 'csrf_token':
+                        post['_csrf'] = match.groupdict()['value']
+                        
             post['password'] = self.__credentials['password']
             
             upr = urlparse(r.url)
@@ -346,7 +372,7 @@ class WeConnect():
                 logger.info('No carnet scheme found in response.')
                 soup = BeautifulSoup(r.text, 'html.parser')
                 metakits = soup.find_all("meta", {'name':'identitykit'})
-                print(metakits)
+                logger.debug(metakits)
                 for metakit in metakits: 
                     if (metakit['content'] == 'termsAndConditions'): #updated terms and conditions?
                         logger.debug('Meta identitykit is termsandconditions')
@@ -634,7 +660,7 @@ class WeConnect():
                 'type': 'setSettings',
                 'settings': {
                     'targetTemperature': dk,
-                    'climatisationWithoutHVpower': False,
+                    'climatisationWithoutHVpower': True,
                     'heaterSource': 'electric',
                     }
                 }
